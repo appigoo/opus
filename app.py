@@ -559,8 +559,11 @@ def generate_voice_html(text):
 # CHARTING
 # ═══════════════════════════════════════════════════════
 
-def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
-    """Create chart matching the screenshot style."""
+def create_chart(df, ticker, support_levels, resistance_levels, signal_info, timeframe_key="1h"):
+    """
+    Create chart matching the screenshot style.
+    Uses sequential integer x-axis to eliminate non-trading time gaps.
+    """
 
     fig = make_subplots(
         rows=3, cols=1,
@@ -570,9 +573,43 @@ def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
         subplot_titles=["K線 + 趨勢 + 支撐阻力", "MACD / DIF / DEA / Histogram", "成交量"]
     )
 
+    # ── Sequential x-axis (removes non-trading gaps) ──
+    x_seq = list(range(len(df)))
+    timestamps = df.index.tolist()
+
+    # Build tick labels: show date/time at sensible intervals
+    n = len(df)
+    if n <= 60:
+        tick_step = max(1, n // 10)
+    elif n <= 200:
+        tick_step = max(1, n // 12)
+    else:
+        tick_step = max(1, n // 15)
+
+    tickvals = list(range(0, n, tick_step))
+    # Format based on timeframe
+    intraday = timeframe_key in ("1m", "5m", "15m", "30m", "1h")
+    ticktext = []
+    prev_date = None
+    for i in tickvals:
+        ts = timestamps[i]
+        if hasattr(ts, 'strftime'):
+            if intraday:
+                d = ts.strftime('%b %d')
+                t = ts.strftime('%H:%M')
+                if d != prev_date:
+                    ticktext.append(f"{d}\n{t}")
+                    prev_date = d
+                else:
+                    ticktext.append(t)
+            else:
+                ticktext.append(ts.strftime('%b %d\n%Y'))
+        else:
+            ticktext.append(str(i))
+
     # ─── Row 1: Candlestick + EMA + S/R ───
     fig.add_trace(go.Candlestick(
-        x=df.index,
+        x=x_seq,
         open=df['Open'], high=df['High'],
         low=df['Low'], close=df['Close'],
         increasing_line_color='#4caf50',
@@ -585,34 +622,34 @@ def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
 
     # EMA lines
     fig.add_trace(go.Scatter(
-        x=df.index, y=df['EMA_fast'],
+        x=x_seq, y=df['EMA_fast'],
         line=dict(color='#2196f3', width=1.5),
         name=f'EMA{EMA_FAST}',
         opacity=0.8
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=df['EMA_slow'],
+        x=x_seq, y=df['EMA_slow'],
         line=dict(color='#ff9800', width=1.5),
         name=f'EMA{EMA_SLOW}',
         opacity=0.8
     ), row=1, col=1)
 
-    # Bollinger Bands (for reference envelope)
+    # Bollinger Bands
     bb_mid = df['Close'].rolling(20).mean()
     bb_std = df['Close'].rolling(20).std()
     bb_upper = bb_mid + 2 * bb_std
     bb_lower = bb_mid - 2 * bb_std
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=bb_upper,
+        x=x_seq, y=bb_upper,
         line=dict(color='#e53935', width=1, dash='dash'),
         name='BB Upper',
         opacity=0.4
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=bb_lower,
+        x=x_seq, y=bb_lower,
         line=dict(color='#4caf50', width=1, dash='dash'),
         name='BB Lower',
         opacity=0.4
@@ -645,20 +682,20 @@ def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
     colors = ['#4caf50' if v >= 0 else '#e53935' for v in df['Histogram']]
 
     fig.add_trace(go.Bar(
-        x=df.index, y=df['Histogram'],
+        x=x_seq, y=df['Histogram'],
         marker_color=colors,
         name='Histogram',
         opacity=0.7
     ), row=2, col=1)
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=df['DIF'],
+        x=x_seq, y=df['DIF'],
         line=dict(color='#2196f3', width=1.5),
         name='DIF'
     ), row=2, col=1)
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=df['DEA'],
+        x=x_seq, y=df['DEA'],
         line=dict(color='#ff9800', width=1.5),
         name='DEA'
     ), row=2, col=1)
@@ -668,7 +705,7 @@ def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
                   else '#e53935' for i in range(len(df))]
 
     fig.add_trace(go.Bar(
-        x=df.index, y=df['Volume'],
+        x=x_seq, y=df['Volume'],
         marker_color=vol_colors,
         name='成交量',
         opacity=0.7
@@ -677,7 +714,7 @@ def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
     # Volume SMA
     vol_sma = df['Volume'].rolling(20).mean()
     fig.add_trace(go.Scatter(
-        x=df.index, y=vol_sma,
+        x=x_seq, y=vol_sma,
         line=dict(color='#ff9800', width=1),
         name='Vol SMA20',
         opacity=0.6
@@ -690,19 +727,37 @@ def create_chart(df, ticker, support_levels, resistance_levels, signal_info):
         plot_bgcolor='#ffffff',
         font=dict(family="Noto Sans TC, JetBrains Mono, sans-serif", size=12, color='#2d2d2d'),
         showlegend=False,
-        margin=dict(l=50, r=20, t=30, b=20),
+        margin=dict(l=50, r=20, t=30, b=30),
         xaxis_rangeslider_visible=False,
     )
 
+    # Apply sequential tick labels to all x-axes
     for i in range(1, 4):
         fig.update_xaxes(
             gridcolor='#f0f0e8', showgrid=True,
-            zeroline=False, row=i, col=1
+            zeroline=False,
+            tickvals=tickvals,
+            ticktext=ticktext if i == 3 else [''] * len(tickvals),  # only show labels on bottom
+            row=i, col=1
         )
         fig.update_yaxes(
             gridcolor='#f0f0e8', showgrid=True,
             zeroline=False, row=i, col=1
         )
+
+    # Show tick labels on bottom chart only
+    fig.update_xaxes(
+        tickvals=tickvals,
+        ticktext=ticktext,
+        tickangle=0,
+        tickfont=dict(size=10),
+        row=3, col=1
+    )
+
+    # Hover: show actual timestamp
+    fig.update_layout(
+        hovermode='x unified',
+    )
 
     return fig
 
@@ -964,7 +1019,7 @@ if scan_btn or auto_refresh:
 
                 with col_chart:
                     # Main chart
-                    chart = create_chart(df, ticker, support, resistance, sig)
+                    chart = create_chart(df, ticker, support, resistance, sig, timeframe)
                     st.plotly_chart(chart, use_container_width=True, config={'displayModeBar': False})
 
                 with col_info:
@@ -1085,6 +1140,70 @@ if scan_btn or auto_refresh:
                                 """, unsafe_allow_html=True)
 
                         st.markdown("</div>", unsafe_allow_html=True)
+
+        # ═══ Multi-Timeframe Overview ═══
+        st.markdown("---")
+        st.markdown("### 🕐 多時間框架總覽")
+        mtf_ticker = st.selectbox("選擇股票查看多時間框架", tickers, key="mtf_select")
+
+        all_tfs = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk"]
+        tf_labels = {"1m":"1分鐘","5m":"5分鐘","15m":"15分鐘","30m":"30分鐘","1h":"1小時","1d":"日線","1wk":"週線"}
+
+        mtf_cols = st.columns(len(all_tfs))
+        for ci, tf_key in enumerate(all_tfs):
+            with mtf_cols[ci]:
+                tf_cfg = TIMEFRAME_MAP[tf_key]
+                mtf_df = fetch_data(mtf_ticker, tf_cfg['interval'], tf_cfg['period'])
+                if mtf_df.empty or len(mtf_df) < 30:
+                    st.markdown(f"""
+                    <div class="signal-card hold-signal" style="text-align:center;padding:10px;">
+                        <div style="font-size:12px;font-weight:600;">{tf_labels[tf_key]}</div>
+                        <div style="font-size:11px;color:var(--text-secondary);">數據不足</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    continue
+
+                mtf_df['EMA_fast'] = calc_ema(mtf_df['Close'], ema_fast_input)
+                mtf_df['EMA_slow'] = calc_ema(mtf_df['Close'], ema_slow_input)
+                mtf_df['DIF'] = mtf_df['EMA_fast'] - mtf_df['EMA_slow']
+                mtf_df['DEA'] = calc_ema(mtf_df['DIF'], macd_sig_input)
+                mtf_df['Histogram'] = mtf_df['DIF'] - mtf_df['DEA']
+
+                sr_df_mtf = fetch_data(mtf_ticker, tf_cfg['sr_interval'], tf_cfg['sr_period'])
+                if sr_df_mtf.empty or len(sr_df_mtf) < 20:
+                    sr_df_mtf = mtf_df
+                sup_m, res_m = find_support_resistance(sr_df_mtf, min_touches=sr_min_touches, tolerance_pct=sr_tolerance/100)
+                sig_m = analyze_signals(mtf_df, sup_m, res_m)
+
+                sig_type_m = sig_m['signal_type']
+                if sig_type_m in ('strong_buy', 'buy', 'watch_buy'):
+                    card_cls = "normal-buy" if sig_type_m != 'strong_buy' else "strong-buy"
+                    col_m = "#4caf50"
+                    arrow = "▲"
+                elif sig_type_m in ('strong_sell', 'sell', 'watch_sell'):
+                    card_cls = "normal-sell" if sig_type_m != 'strong_sell' else "strong-sell"
+                    col_m = "#e53935"
+                    arrow = "▼"
+                else:
+                    card_cls = "hold-signal"
+                    col_m = "#6b6b6b"
+                    arrow = "●"
+
+                trend_icon = "🟢" if sig_m.get('trend_bullish') else "🔴"
+                macd_icon = "🟢" if sig_m['dif'] > sig_m['dea'] else "🔴"
+
+                st.markdown(f"""
+                <div class="signal-card {card_cls}" style="text-align:center;padding:10px;">
+                    <div style="font-size:12px;font-weight:600;">{tf_labels[tf_key]}</div>
+                    <div style="font-size:14px;font-weight:700;color:{col_m};margin:4px 0;">{arrow} {sig_m['signal']}</div>
+                    <div style="font-size:11px;color:var(--text-secondary);">
+                        趨勢{trend_icon} MACD{macd_icon}
+                    </div>
+                    <div style="font-size:11px;color:{col_m};font-family:'JetBrains Mono',monospace;">
+                        {sig_m['strength']}%
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
         # ─── Scan info footer ───
         st.markdown(f"""
