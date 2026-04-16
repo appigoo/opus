@@ -350,37 +350,281 @@ def find_support_resistance(df, min_touches=2, tolerance_pct=0.003):
     return support, resistance
 
 
+def calc_atr(df, period=14):
+    """Average True Range for stop-loss calculation."""
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def check_multi_ema_array(df):
+    """
+    [Improvement #2] Multi-EMA alignment check.
+    Returns: ('bullish_strong'|'bullish'|'neutral'|'bearish'|'bearish_strong', detail)
+    """
+    if len(df) < 60:
+        return 'neutral', "數據不足"
+
+    close = df['Close']
+    ema5 = close.ewm(span=5, adjust=False).mean().iloc[-1]
+    ema10 = close.ewm(span=10, adjust=False).mean().iloc[-1]
+    ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+    ema60 = close.ewm(span=60, adjust=False).mean().iloc[-1]
+
+    # Perfect bullish array: EMA5 > EMA10 > EMA20 > EMA60
+    if ema5 > ema10 > ema20 > ema60:
+        return 'bullish_strong', f"多頭排列 5>{ema5:.2f} 10>{ema10:.2f} 20>{ema20:.2f} 60>{ema60:.2f}"
+    # Bullish: mostly aligned up
+    if ema5 > ema20 and ema10 > ema20:
+        return 'bullish', "偏多"
+    # Perfect bearish array
+    if ema5 < ema10 < ema20 < ema60:
+        return 'bearish_strong', "空頭排列"
+    if ema5 < ema20 and ema10 < ema20:
+        return 'bearish', "偏空"
+    return 'neutral', "混亂"
+
+
+def check_macd_momentum(df, lookback=3):
+    """
+    [Improvement #1 & #3] MACD momentum grading.
+    Detects histogram contraction even before a full cross.
+    Returns: dict with momentum_state + score adjustment
+    """
+    if len(df) < lookback + 2:
+        return {'state': 'unknown', 'score': 0, 'desc': '數據不足'}
+
+    hist = df['Histogram'].iloc[-(lookback+1):].values
+    latest = hist[-1]
+
+    # Bullish momentum scenarios
+    if latest > 0 and all(hist[i] >= hist[i-1] for i in range(1, len(hist))):
+        return {'state': 'bull_accelerate', 'score': 1.5, 'desc': '多頭加速'}
+
+    # Histogram negative but contracting (getting closer to 0) = momentum weakening bearish
+    if latest < 0 and all(hist[i] > hist[i-1] for i in range(1, len(hist))):
+        # abs value shrinking over lookback bars
+        return {'state': 'bull_pending', 'score': 1.0, 'desc': '負值收縮中→多頭蓄勢'}
+
+    # Bearish momentum
+    if latest < 0 and all(hist[i] <= hist[i-1] for i in range(1, len(hist))):
+        return {'state': 'bear_accelerate', 'score': -1.5, 'desc': '空頭加速'}
+
+    if latest > 0 and all(hist[i] < hist[i-1] for i in range(1, len(hist))):
+        return {'state': 'bear_pending', 'score': -1.0, 'desc': '正值收縮中→空頭蓄勢'}
+
+    return {'state': 'neutral', 'score': 0, 'desc': '動能中性'}
+
+
+def validate_breakout(df, level, direction='up', confirm_bars=2, vol_threshold=1.2):
+    """
+    [Improvement #4 & #5] Breakout validation + fake breakout filter.
+    - Closing bar(s) must be above (below for bearish) level
+    - Volume confirmation
+    - Check if price retraced back within last 3 bars (= fake breakout)
+    """
+    if len(df) < confirm_bars + 3:
+        return {'valid': False, 'reason': '數據不足', 'is_fake': False}
+
+    recent = df.tail(5)
+    closes = recent['Close'].values
+    vol_sma = df['Volume'].rolling(20).mean().iloc[-1]
+    recent_vol = recent['Volume'].values
+    price = closes[-1]
+
+    if direction == 'up':
+        # Must close above level on latest bar
+        if price <= level:
+            return {'valid': False, 'reason': '未突破', 'is_fake': False}
+
+        # Count confirm bars above level
+        bars_above = sum(1 for c in closes[-confirm_bars:] if c > level)
+        if bars_above < confirm_bars:
+            # Single bar breakout — weak
+            return {'valid': True, 'reason': '初次突破(未確認)', 'is_fake': False, 'strength': 'weak'}
+
+        # Volume check at breakout bar
+        # Find the breakout bar (first close above level in last 5)
+        breakout_idx = None
+        for i in range(len(closes)):
+            if closes[i] > level and (i == 0 or closes[i-1] <= level):
+                breakout_idx = i
+                break
+
+        vol_ok = True
+        if breakout_idx is not None:
+            vol_at_breakout = recent_vol[breakout_idx]
+            vol_ok = vol_at_breakout >= vol_sma * vol_threshold
+
+        # Fake breakout check: did price close back below level after breaking out?
+        is_fake = False
+        if breakout_idx is not None and breakout_idx < len(closes) - 1:
+            post_bars = closes[breakout_idx+1:]
+            if any(c < level for c in post_bars):
+                is_fake = True
+
+        if is_fake:
+            return {'valid': False, 'reason': '假突破(回落)', 'is_fake': True}
+        if not vol_ok:
+            return {'valid': True, 'reason': '突破(量能不足)', 'is_fake': False, 'strength': 'medium'}
+
+        return {'valid': True, 'reason': '有效突破', 'is_fake': False, 'strength': 'strong'}
+
+    else:  # direction == 'down'
+        if price >= level:
+            return {'valid': False, 'reason': '未跌破', 'is_fake': False}
+
+        bars_below = sum(1 for c in closes[-confirm_bars:] if c < level)
+        if bars_below < confirm_bars:
+            return {'valid': True, 'reason': '初次跌破(未確認)', 'is_fake': False, 'strength': 'weak'}
+
+        breakout_idx = None
+        for i in range(len(closes)):
+            if closes[i] < level and (i == 0 or closes[i-1] >= level):
+                breakout_idx = i
+                break
+
+        vol_ok = True
+        if breakout_idx is not None:
+            vol_ok = recent_vol[breakout_idx] >= vol_sma * vol_threshold
+
+        is_fake = False
+        if breakout_idx is not None and breakout_idx < len(closes) - 1:
+            post_bars = closes[breakout_idx+1:]
+            if any(c > level for c in post_bars):
+                is_fake = True
+
+        if is_fake:
+            return {'valid': False, 'reason': '假跌破(回升)', 'is_fake': True}
+        if not vol_ok:
+            return {'valid': True, 'reason': '跌破(量能不足)', 'is_fake': False, 'strength': 'medium'}
+
+        return {'valid': True, 'reason': '有效跌破', 'is_fake': False, 'strength': 'strong'}
+
+
+def generate_trade_plan(price, signal_type, support_levels, resistance_levels, atr, confidence="MEDIUM"):
+    """
+    [Improvement #7] Generate complete trade plan.
+    Position sizing now uses confidence tier (HIGH/MEDIUM/LOW).
+    """
+    plan = {
+        'entry': price,
+        'stop_loss': None,
+        'tp1': None,
+        'tp2': None,
+        'risk_reward': None,
+        'position_size_pct': 0,
+        'notes': '',
+    }
+
+    if atr is None or np.isnan(atr):
+        atr = price * 0.01  # fallback 1%
+
+    # Size map: HIGH conf = full size, MEDIUM = 60%, LOW = 30%
+    size_by_conf = {"HIGH": 100, "MEDIUM": 60, "LOW": 30, "NONE": 0}
+
+    if signal_type in ('strong_buy', 'buy'):
+        if support_levels:
+            sup = support_levels[0][0]
+            sl_by_sr = sup * 0.995
+        else:
+            sl_by_sr = price - 1.5 * atr
+        sl_by_atr = price - 1.5 * atr
+        plan['stop_loss'] = max(sl_by_sr, sl_by_atr)
+
+        if resistance_levels:
+            plan['tp1'] = resistance_levels[0][0]
+            if len(resistance_levels) > 1:
+                plan['tp2'] = resistance_levels[1][0]
+            else:
+                plan['tp2'] = price + (plan['tp1'] - price) * 1.618
+        else:
+            plan['tp1'] = price + 2 * atr
+            plan['tp2'] = price + 3.5 * atr
+
+        risk = price - plan['stop_loss']
+        reward1 = plan['tp1'] - price
+        if risk > 0:
+            plan['risk_reward'] = reward1 / risk
+
+        # Strong_buy gets 100% regardless; otherwise use confidence
+        if signal_type == 'strong_buy':
+            plan['position_size_pct'] = 100
+        else:
+            plan['position_size_pct'] = size_by_conf.get(confidence, 60)
+        plan['notes'] = f"進場 ${price:.2f} | 止損 ${plan['stop_loss']:.2f} (-{(1-plan['stop_loss']/price)*100:.2f}%) | TP1 ${plan['tp1']:.2f} | TP2 ${plan['tp2']:.2f}"
+
+    elif signal_type in ('strong_sell', 'sell'):
+        if resistance_levels:
+            res = resistance_levels[0][0]
+            sl_by_sr = res * 1.005
+        else:
+            sl_by_sr = price + 1.5 * atr
+        sl_by_atr = price + 1.5 * atr
+        plan['stop_loss'] = min(sl_by_sr, sl_by_atr)
+
+        if support_levels:
+            plan['tp1'] = support_levels[0][0]
+            if len(support_levels) > 1:
+                plan['tp2'] = support_levels[1][0]
+            else:
+                plan['tp2'] = price - (price - plan['tp1']) * 1.618
+        else:
+            plan['tp1'] = price - 2 * atr
+            plan['tp2'] = price - 3.5 * atr
+
+        risk = plan['stop_loss'] - price
+        reward1 = price - plan['tp1']
+        if risk > 0:
+            plan['risk_reward'] = reward1 / risk
+
+        if signal_type == 'strong_sell':
+            plan['position_size_pct'] = 100
+        else:
+            plan['position_size_pct'] = size_by_conf.get(confidence, 60)
+        plan['notes'] = f"做空 ${price:.2f} | 止損 ${plan['stop_loss']:.2f} (+{(plan['stop_loss']/price-1)*100:.2f}%) | TP1 ${plan['tp1']:.2f} | TP2 ${plan['tp2']:.2f}"
+
+    return plan
+
+
 def analyze_signals(df, support_levels, resistance_levels):
     """
-    Triple Confirmation Logic:
-    1. Trend: EMA fast vs slow
-    2. MACD: Golden/Death cross + Histogram flip
-    3. S/R Breakout: Price vs key levels
+    Upgraded Triple Confirmation Logic v2 — incorporating 7 improvements:
+    1. MACD momentum grading (not just golden/death cross)
+    2. Multi-EMA array confirmation (5>10>20>60)
+    3. Histogram contraction detection
+    4. Breakout validity check (bars + volume)
+    5. Fake breakout filter
+    6. MTF resonance placeholder (filled by caller)
+    7. Trade plan generation
     """
     if df.empty or len(df) < 30:
         return {
-            'signal': '數據不足',
-            'signal_type': 'hold',
-            'trend': '未知',
-            'macd_cross': '未知',
-            'histogram_momentum': 0,
-            'sr_status': '未知',
-            'strength': 0,
-            'details': {}
+            'signal': '數據不足', 'signal_type': 'hold', 'trend': '未知',
+            'macd_cross': '未知', 'histogram_momentum': 0, 'sr_status': '未知',
+            'strength': 0, 'details': {}, 'trade_plan': None,
         }
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
     price = latest['Close']
 
-    # 1. Trend Confirmation
+    # ─── 1. Trend (EMA 12/26 — original) ───
     ema_fast = latest['EMA_fast']
     ema_slow = latest['EMA_slow']
     trend_bullish = ema_fast > ema_slow
     trend = "上升趨勢" if trend_bullish else "下降趨勢"
     trend_strength = abs(ema_fast - ema_slow) / price * 100
 
-    # 2. MACD Confirmation
+    # ─── [IMPROVEMENT #2] Multi-EMA array ───
+    ema_array_state, ema_array_desc = check_multi_ema_array(df)
+
+    # ─── 2. MACD (classic + momentum grading) ───
     dif = latest['DIF']
     dea = latest['DEA']
     prev_dif = prev['DIF']
@@ -392,9 +636,11 @@ def analyze_signals(df, support_levels, resistance_levels):
     death_cross = prev_dif >= prev_dea and dif < dea
     hist_flip_positive = prev_hist <= 0 and hist > 0
     hist_flip_negative = prev_hist >= 0 and hist < 0
-
     macd_bullish = dif > dea
     macd_bearish = dif < dea
+
+    # [IMPROVEMENT #1 & #3] MACD momentum grading
+    macd_momentum = check_macd_momentum(df, lookback=3)
 
     if golden_cross:
         macd_cross = "金叉 ✦"
@@ -405,28 +651,38 @@ def analyze_signals(df, support_levels, resistance_levels):
     else:
         macd_cross = "DIF < DEA"
 
-    # 3. Support/Resistance Breakout
-    sr_status = "無突破"
-    breakout_bullish = False
-    breakout_bearish = False
+    # ─── 3. Support/Resistance with validation ───
     closest_resistance = resistance_levels[0][0] if resistance_levels else None
     closest_support = support_levels[0][0] if support_levels else None
 
-    # Check resistance breakout
+    # [IMPROVEMENT #4 & #5] Validate breakout
+    breakout_bullish = False
+    breakout_bearish = False
+    breakout_quality = 'none'
+    is_fake_breakout = False
+    sr_status = "無突破"
+
     if closest_resistance and price > closest_resistance:
-        tol = price * 0.001
-        if price > closest_resistance + tol:
+        val = validate_breakout(df, closest_resistance, direction='up')
+        if val['valid']:
             breakout_bullish = True
-            sr_status = f"突破阻力 {closest_resistance:.2f}"
+            breakout_quality = val.get('strength', 'medium')
+            sr_status = f"突破阻力 {closest_resistance:.2f} ({val['reason']})"
+        elif val['is_fake']:
+            is_fake_breakout = True
+            sr_status = f"假突破 {closest_resistance:.2f} ⚠️"
 
-    # Check support breakdown
     if closest_support and price < closest_support:
-        tol = price * 0.001
-        if price < closest_support - tol:
+        val = validate_breakout(df, closest_support, direction='down')
+        if val['valid']:
             breakout_bearish = True
-            sr_status = f"跌破支撐 {closest_support:.2f}"
+            breakout_quality = val.get('strength', 'medium')
+            sr_status = f"跌破支撐 {closest_support:.2f} ({val['reason']})"
+        elif val['is_fake']:
+            is_fake_breakout = True
+            sr_status = f"假跌破 {closest_support:.2f} ⚠️"
 
-    if not breakout_bullish and not breakout_bearish:
+    if not breakout_bullish and not breakout_bearish and not is_fake_breakout:
         if closest_resistance:
             dist_r = abs(price - closest_resistance) / price * 100
             if dist_r < 0.5:
@@ -436,68 +692,205 @@ def analyze_signals(df, support_levels, resistance_levels):
             if dist_s < 0.5:
                 sr_status = f"接近支撐 {closest_support:.2f}"
 
-    # Volume confirmation
+    # ─── Volume ───
     vol_sma = df['Volume'].rolling(20).mean().iloc[-1]
     vol_current = latest['Volume']
     vol_ratio = vol_current / vol_sma if vol_sma > 0 else 1
     vol_surge = vol_ratio > 1.5
 
-    # ═══ Triple Confirmation Signal Logic ═══
+    # ─── ATR for trade plan ───
+    atr_series = calc_atr(df, 14)
+    atr_val = atr_series.iloc[-1] if not atr_series.empty else price * 0.01
+
+    # ═══ UPGRADED SIGNAL LOGIC ═══
+    buy_score = 0
+    sell_score = 0
+
+    # Classic trend
+    if trend_bullish:
+        buy_score += 1
+    else:
+        sell_score += 1
+
+    # [IMPROVEMENT #2] Multi-EMA weight
+    if ema_array_state == 'bullish_strong':
+        buy_score += 1.5
+    elif ema_array_state == 'bullish':
+        buy_score += 0.7
+    elif ema_array_state == 'bearish_strong':
+        sell_score += 1.5
+    elif ema_array_state == 'bearish':
+        sell_score += 0.7
+
+    # Classic MACD cross
+    if golden_cross:
+        buy_score += 1.5
+    elif macd_bullish:
+        buy_score += 0.7
+    if death_cross:
+        sell_score += 1.5
+    elif macd_bearish:
+        sell_score += 0.7
+
+    # [IMPROVEMENT #1 & #3] MACD momentum additions
+    if macd_momentum['score'] > 0:
+        buy_score += macd_momentum['score']
+    elif macd_momentum['score'] < 0:
+        sell_score += abs(macd_momentum['score'])
+
+    # [IMPROVEMENT #4] Breakout quality weighting
+    if breakout_bullish:
+        if breakout_quality == 'strong':
+            buy_score += 2.0
+        elif breakout_quality == 'medium':
+            buy_score += 1.2
+        else:
+            buy_score += 0.6
+    if breakout_bearish:
+        if breakout_quality == 'strong':
+            sell_score += 2.0
+        elif breakout_quality == 'medium':
+            sell_score += 1.2
+        else:
+            sell_score += 0.6
+
+    # [IMPROVEMENT #5] Fake breakout penalty
+    if is_fake_breakout:
+        buy_score -= 1.5
+        sell_score -= 1.5
+
+    # Volume boost
+    if vol_surge:
+        if buy_score > sell_score:
+            buy_score += 0.8
+        else:
+            sell_score += 0.8
+
+    # ─── Signal classification ───
+    # Thresholds tuned for new scoring system
     signal_type = "hold"
     signal = "觀望"
     strength = 0
 
-    # Count confirmations for BUY
-    buy_confirms = 0
-    if trend_bullish:
-        buy_confirms += 1
-    if macd_bullish or golden_cross:
-        buy_confirms += 1
-    if golden_cross:
-        buy_confirms += 0.5  # extra weight for fresh cross
+    net_score = buy_score - sell_score
 
-    # Count confirmations for SELL
-    sell_confirms = 0
-    if not trend_bullish:
-        sell_confirms += 1
-    if macd_bearish or death_cross:
-        sell_confirms += 1
-    if death_cross:
-        sell_confirms += 0.5
+    # ═══ DIRECT ACTION CLASSIFICATION ═══
+    # Three explicit commands: 做多 / 做空 / 不動 (with confidence tier)
+    # Lowered thresholds — user wants decisive calls, not cautious "watch" labels
 
-    # Apply triple confirmation
-    if buy_confirms >= 2:
-        if breakout_bullish or (vol_surge and buy_confirms >= 2.5):
-            signal = "強烈買入 🔥"
+    signal_type = "hold"
+    signal = "不動"
+    action = "HOLD"
+    confidence = "LOW"
+    strength = 0
+    entry_trigger = ""  # concrete next-candle trigger
+
+    # ─── BUY SIDE ───
+    if buy_score >= 4.0 and net_score >= 2.0:
+        # Decisive long
+        if (breakout_bullish and breakout_quality == 'strong') or buy_score >= 5.5:
+            signal = "強烈做多 🔥"
+            action = "STRONG_BUY"
+            confidence = "HIGH"
             signal_type = "strong_buy"
-            strength = min(100, int(buy_confirms * 25 + (30 if breakout_bullish else 0) + (20 if vol_surge else 0)))
         else:
-            signal = "普通買入"
+            signal = "做多"
+            action = "BUY"
+            confidence = "HIGH"
             signal_type = "buy"
-            strength = min(80, int(buy_confirms * 20 + (15 if vol_surge else 0)))
-    elif sell_confirms >= 2:
-        if breakout_bearish or (vol_surge and sell_confirms >= 2.5):
-            signal = "強烈賣出 🔥"
+        strength = min(100, int(buy_score * 14))
+        entry_trigger = f"立即進場 ${price:.2f}"
+
+    elif buy_score >= 2.5 and net_score >= 1.0:
+        # Moderate long — still give a BUY command, not "watch"
+        signal = "做多"
+        action = "BUY"
+        confidence = "MEDIUM"
+        signal_type = "buy"
+        strength = min(85, int(buy_score * 16))
+        # Give concrete entry trigger
+        if closest_support and price > closest_support:
+            entry_trigger = f"立即進場 ${price:.2f}，或回測 ${closest_support:.2f} 加碼"
+        elif closest_resistance:
+            entry_trigger = f"立即進場 ${price:.2f}，突破 ${closest_resistance:.2f} 加碼"
+        else:
+            entry_trigger = f"立即進場 ${price:.2f}"
+
+    # ─── SELL SIDE ───
+    elif sell_score >= 4.0 and net_score <= -2.0:
+        if (breakout_bearish and breakout_quality == 'strong') or sell_score >= 5.5:
+            signal = "強烈做空 🔥"
+            action = "STRONG_SELL"
+            confidence = "HIGH"
             signal_type = "strong_sell"
-            strength = min(100, int(sell_confirms * 25 + (30 if breakout_bearish else 0) + (20 if vol_surge else 0)))
         else:
-            signal = "普通賣出"
+            signal = "做空"
+            action = "SELL"
+            confidence = "HIGH"
             signal_type = "sell"
-            strength = min(80, int(sell_confirms * 20 + (15 if vol_surge else 0)))
-    else:
-        # Partial signals
-        if hist_flip_positive:
-            signal = "動能轉多（待確認）"
-            signal_type = "watch_buy"
-            strength = 30
-        elif hist_flip_negative:
-            signal = "動能轉空（待確認）"
-            signal_type = "watch_sell"
-            strength = 30
+        strength = min(100, int(sell_score * 14))
+        entry_trigger = f"立即進場 ${price:.2f}"
+
+    elif sell_score >= 2.5 and net_score <= -1.0:
+        signal = "做空"
+        action = "SELL"
+        confidence = "MEDIUM"
+        signal_type = "sell"
+        strength = min(85, int(sell_score * 16))
+        if closest_resistance and price < closest_resistance:
+            entry_trigger = f"立即做空 ${price:.2f}，或反彈至 ${closest_resistance:.2f} 加碼"
         else:
-            signal = "觀望"
-            signal_type = "hold"
-            strength = 0
+            entry_trigger = f"立即做空 ${price:.2f}"
+
+    # ─── EDGE CASES: CONFLICTING SIGNALS → STILL GIVE DIRECTION ───
+    elif abs(net_score) >= 0.5:
+        # Mild directional bias — give a LOW confidence call, still actionable
+        if net_score > 0:
+            signal = "做多"
+            action = "BUY"
+            confidence = "LOW"
+            signal_type = "buy"
+            strength = max(25, int(buy_score * 12))
+            # For low confidence, suggest waiting for trigger
+            if closest_resistance:
+                entry_trigger = f"等突破 ${closest_resistance:.2f} 進場（小倉位）"
+            elif macd_momentum.get('state') == 'bull_pending':
+                entry_trigger = f"等 MACD 金叉確認後進場"
+            else:
+                entry_trigger = f"小倉位試單 ${price:.2f}，止損收緊"
+        else:
+            signal = "做空"
+            action = "SELL"
+            confidence = "LOW"
+            signal_type = "sell"
+            strength = max(25, int(sell_score * 12))
+            if closest_support:
+                entry_trigger = f"等跌破 ${closest_support:.2f} 進場（小倉位）"
+            elif macd_momentum.get('state') == 'bear_pending':
+                entry_trigger = f"等 MACD 死叉確認後進場"
+            else:
+                entry_trigger = f"小倉位試空 ${price:.2f}，止損收緊"
+    else:
+        # Truly no signal — explicit "不動" with reason
+        signal = "不動"
+        action = "HOLD"
+        confidence = "NONE"
+        signal_type = "hold"
+        strength = 0
+        entry_trigger = "無明確方向，等待指標共振"
+
+    # Reformat signal text to always include confidence tier
+    if action in ("BUY", "STRONG_BUY"):
+        display_signal = f"{signal} · {confidence}信心"
+    elif action in ("SELL", "STRONG_SELL"):
+        display_signal = f"{signal} · {confidence}信心"
+    else:
+        display_signal = signal
+
+    signal = display_signal
+
+    # [IMPROVEMENT #7] Generate trade plan
+    trade_plan = generate_trade_plan(price, signal_type, support_levels, resistance_levels, atr_val, confidence)
 
     return {
         'signal': signal,
@@ -505,7 +898,10 @@ def analyze_signals(df, support_levels, resistance_levels):
         'trend': trend,
         'trend_bullish': trend_bullish,
         'trend_strength': trend_strength,
+        'ema_array_state': ema_array_state,
+        'ema_array_desc': ema_array_desc,
         'macd_cross': macd_cross,
+        'macd_momentum': macd_momentum,
         'golden_cross': golden_cross,
         'death_cross': death_cross,
         'dif': dif,
@@ -517,14 +913,25 @@ def analyze_signals(df, support_levels, resistance_levels):
         'sr_status': sr_status,
         'breakout_bullish': breakout_bullish,
         'breakout_bearish': breakout_bearish,
+        'breakout_quality': breakout_quality,
+        'is_fake_breakout': is_fake_breakout,
         'closest_support': closest_support,
         'closest_resistance': closest_resistance,
         'vol_ratio': vol_ratio,
         'vol_surge': vol_surge,
         'strength': strength,
+        'buy_score': round(buy_score, 2),
+        'sell_score': round(sell_score, 2),
+        'net_score': round(net_score, 2),
+        'action': action,
+        'confidence': confidence,
+        'entry_trigger': entry_trigger,
         'price': price,
         'ema_fast': ema_fast,
         'ema_slow': ema_slow,
+        'atr': atr_val,
+        'trade_plan': trade_plan,
+        'mtf_resonance': None,  # filled by scan loop
     }
 
 
@@ -894,6 +1301,50 @@ def run_scan():
         # Analyze signals
         signal_info = analyze_signals(df, support, resistance)
 
+        # ─── [IMPROVEMENT #6] Multi-Timeframe Resonance ───
+        # Check the timeframe above and below current for directional agreement
+        tf_order = ["1m", "5m", "15m", "30m", "1h", "1d", "1wk"]
+        current_idx = tf_order.index(timeframe) if timeframe in tf_order else 3
+        mtf_checks = []
+        resonance_score = 0
+
+        neighbor_tfs = []
+        if current_idx > 0:
+            neighbor_tfs.append(tf_order[current_idx - 1])  # lower TF
+        if current_idx < len(tf_order) - 1:
+            neighbor_tfs.append(tf_order[current_idx + 1])  # higher TF
+
+        current_bullish = signal_info['signal_type'] in ('strong_buy', 'buy', 'watch_buy')
+        current_bearish = signal_info['signal_type'] in ('strong_sell', 'sell', 'watch_sell')
+
+        for ntf in neighbor_tfs:
+            n_cfg = TIMEFRAME_MAP[ntf]
+            n_df = fetch_data(ticker, n_cfg['interval'], n_cfg['period'])
+            if n_df.empty or len(n_df) < 30:
+                mtf_checks.append({'tf': ntf, 'agree': False, 'reason': '數據不足'})
+                continue
+            n_df['EMA_fast'] = calc_ema(n_df['Close'], ema_fast_input)
+            n_df['EMA_slow'] = calc_ema(n_df['Close'], ema_slow_input)
+            n_trend_bull = n_df['EMA_fast'].iloc[-1] > n_df['EMA_slow'].iloc[-1]
+
+            if current_bullish and n_trend_bull:
+                mtf_checks.append({'tf': ntf, 'agree': True, 'reason': '多頭一致'})
+                resonance_score += 1
+            elif current_bearish and not n_trend_bull:
+                mtf_checks.append({'tf': ntf, 'agree': True, 'reason': '空頭一致'})
+                resonance_score += 1
+            else:
+                mtf_checks.append({'tf': ntf, 'agree': False, 'reason': '方向分歧'})
+
+        # Apply resonance bonus: +20% strength if all neighbors agree
+        if len(mtf_checks) > 0 and all(c['agree'] for c in mtf_checks):
+            signal_info['strength'] = min(100, int(signal_info['strength'] * 1.2))
+            signal_info['mtf_resonance'] = {'state': 'strong', 'checks': mtf_checks, 'bonus': 20}
+        elif resonance_score > 0:
+            signal_info['mtf_resonance'] = {'state': 'partial', 'checks': mtf_checks, 'bonus': 0}
+        else:
+            signal_info['mtf_resonance'] = {'state': 'none', 'checks': mtf_checks, 'bonus': 0}
+
         results[ticker] = {
             'df': df,
             'support': support,
@@ -901,31 +1352,67 @@ def run_scan():
             'signal': signal_info,
         }
 
-        # Voice alert collection
+        # Voice alert — direct command only
         if enable_voice and signal_info['signal_type'] in ('strong_buy', 'strong_sell', 'buy', 'sell'):
             if not voice_only_strong or signal_info['signal_type'] in ('strong_buy', 'strong_sell'):
-                voice_alerts.append(f"{ticker} {signal_info['signal']}")
+                act = signal_info.get('action', 'HOLD')
+                conf = signal_info.get('confidence', 'NONE')
+                act_word = {"STRONG_BUY":"立即做多","BUY":"做多","STRONG_SELL":"立即做空","SELL":"做空"}.get(act, "")
+                conf_word = {"HIGH":"高信心","MEDIUM":"中信心","LOW":"低信心"}.get(conf, "")
+                voice_alerts.append(f"{ticker} {act_word} {conf_word}")
 
-        # Telegram alert
+        # Telegram alert — direct action command format
         if enable_telegram and tg_bot_token and tg_chat_id:
             if signal_info['signal_type'] in ('strong_buy', 'strong_sell', 'buy', 'sell'):
                 prev_signal = st.session_state.last_signals.get(ticker)
                 if prev_signal != signal_info['signal_type']:
-                    msg = (
-                        f"📊 <b>三重確認訊號</b>\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"🏷 {ticker} | {timeframe}\n"
-                        f"💰 ${signal_info['price']:.2f}\n"
-                        f"📌 {signal_info['signal']}\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"趨勢: {signal_info['trend']}\n"
-                        f"MACD: {signal_info['macd_cross']}\n"
-                        f"S/R: {signal_info['sr_status']}\n"
-                        f"量能: {'放量' if signal_info['vol_surge'] else '正常'} ({signal_info['vol_ratio']:.1f}x)\n"
-                        f"強度: {signal_info['strength']}%\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-                    )
+                    tp = signal_info.get('trade_plan') or {}
+                    reso = signal_info.get('mtf_resonance') or {}
+                    reso_txt = {"strong":"✅ 共振","partial":"⚠️ 部分","none":"❌ 分歧"}.get(reso.get('state','none'), '—')
+                    ema_arr_txt = signal_info.get('ema_array_desc', '—')
+                    mom_txt = signal_info.get('macd_momentum', {}).get('desc', '—')
+                    action_cmd = signal_info.get('action', 'HOLD')
+                    conf = signal_info.get('confidence', 'NONE')
+                    trigger = signal_info.get('entry_trigger', '')
+
+                    # Direct action line — MOST IMPORTANT
+                    if action_cmd == "STRONG_BUY":
+                        action_line = "🔥🟢 <b>立即做多 LONG</b>"
+                    elif action_cmd == "BUY":
+                        action_line = "🟢 <b>做多 LONG</b>"
+                    elif action_cmd == "STRONG_SELL":
+                        action_line = "🔥🔴 <b>立即做空 SHORT</b>"
+                    elif action_cmd == "SELL":
+                        action_line = "🔴 <b>做空 SHORT</b>"
+                    else:
+                        action_line = "⚪ 不動 HOLD"
+
+                    conf_label = {"HIGH":"高信心","MEDIUM":"中信心","LOW":"低信心","NONE":"無訊號"}.get(conf, "—")
+
+                    msg_lines = [
+                        action_line,
+                        f"━━━━━━━━━━━━━━",
+                        f"🏷 <b>{ticker}</b> @ ${signal_info['price']:.2f} | {timeframe}",
+                        f"💪 {conf_label} · 強度 {signal_info['strength']}%",
+                        f"📌 {trigger}",
+                    ]
+                    if tp.get('stop_loss'):
+                        msg_lines += [
+                            f"━━━━━━━━━━━━━━",
+                            f"<b>📋 交易計劃</b>",
+                            f"🎯 進場: ${tp['entry']:.2f}",
+                            f"🛑 止損: ${tp['stop_loss']:.2f}",
+                            f"✅ TP1: ${tp['tp1']:.2f}",
+                            f"🚀 TP2: ${tp['tp2']:.2f}",
+                            f"⚖️ R:R = 1:{tp['risk_reward']:.2f}" if tp.get('risk_reward') else "",
+                            f"📏 建議倉位: {tp['position_size_pct']}%",
+                        ]
+                    msg_lines += [
+                        f"━━━━━━━━━━━━━━",
+                        f"<i>依據: {ema_arr_txt} · MACD {signal_info['macd_cross']} · {mom_txt} · {signal_info['sr_status']} · 量{signal_info['vol_ratio']:.1f}x · MTF {reso_txt}</i>",
+                        f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+                    ]
+                    msg = "\n".join([l for l in msg_lines if l])
                     send_telegram(tg_bot_token, tg_chat_id, msg)
 
         st.session_state.last_signals[ticker] = signal_info.get('signal_type')
@@ -969,31 +1456,57 @@ if scan_btn or auto_refresh:
                 price = sig['price']
                 signal_text = sig['signal']
                 sig_type = sig['signal_type']
+                action = sig.get('action', 'HOLD')
+                confidence = sig.get('confidence', 'NONE')
 
                 # Card class
                 if sig_type == 'strong_buy':
                     card_class = "signal-card strong-buy"
                     price_color = "#4caf50"
+                    action_text = "🔥 立即做多"
+                    action_color = "#4caf50"
                 elif sig_type == 'strong_sell':
                     card_class = "signal-card strong-sell"
                     price_color = "#e53935"
-                elif sig_type in ('buy', 'watch_buy'):
+                    action_text = "🔥 立即做空"
+                    action_color = "#e53935"
+                elif sig_type == 'buy':
                     card_class = "signal-card normal-buy"
                     price_color = "#4caf50"
-                elif sig_type in ('sell', 'watch_sell'):
+                    action_text = "▲ 做多"
+                    action_color = "#4caf50"
+                elif sig_type == 'sell':
                     card_class = "signal-card normal-sell"
                     price_color = "#e53935"
+                    action_text = "▼ 做空"
+                    action_color = "#e53935"
                 else:
                     card_class = "signal-card hold-signal"
                     price_color = "#6b6b6b"
+                    action_text = "● 不動"
+                    action_color = "#6b6b6b"
+
+                # Confidence badge
+                conf_badge_color = {"HIGH": "#4caf50", "MEDIUM": "#ff9800", "LOW": "#9e9e9e", "NONE": "#cccccc"}.get(confidence, "#ccc")
+                conf_label = {"HIGH": "高", "MEDIUM": "中", "LOW": "低", "NONE": "—"}.get(confidence, "—")
 
                 st.markdown(f"""
                 <div class="{card_class}">
                     <div class="ticker-header">{ticker}</div>
                     <div class="price-display" style="color:{price_color};">${price:.2f}</div>
-                    <div style="font-size:15px;font-weight:600;margin:6px 0;color:{price_color};">{signal_text}</div>
-                    <div style="font-size:12px;color:var(--text-secondary);">
-                        強度 {sig['strength']}% | 量能 {sig['vol_ratio']:.1f}x
+                    <div style="font-size:20px;font-weight:800;margin:8px 0;color:{action_color};letter-spacing:1px;">
+                        {action_text}
+                    </div>
+                    <div style="display:flex;gap:6px;justify-content:center;margin-bottom:6px;">
+                        <span style="background:{conf_badge_color};color:white;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;">
+                            {conf_label}信心
+                        </span>
+                        <span style="background:#e8e8e0;color:#333;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600;">
+                            {sig['strength']}%
+                        </span>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-secondary);">
+                        量能 {sig['vol_ratio']:.1f}x
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1014,6 +1527,54 @@ if scan_btn or auto_refresh:
                 sig = r['signal']
                 support = r['support']
                 resistance = r['resistance']
+
+                # ═══ ACTION COMMAND BANNER (top of tab) ═══
+                action = sig.get('action', 'HOLD')
+                confidence = sig.get('confidence', 'NONE')
+                entry_trigger = sig.get('entry_trigger', '')
+                tp = sig.get('trade_plan') or {}
+
+                if action in ("STRONG_BUY", "BUY"):
+                    banner_bg = "linear-gradient(90deg, #4caf50 0%, #66bb6a 100%)"
+                    big_text = "做多 LONG"
+                    arrow = "▲"
+                elif action in ("STRONG_SELL", "SELL"):
+                    banner_bg = "linear-gradient(90deg, #e53935 0%, #ef5350 100%)"
+                    big_text = "做空 SHORT"
+                    arrow = "▼"
+                else:
+                    banner_bg = "linear-gradient(90deg, #9e9e9e 0%, #bdbdbd 100%)"
+                    big_text = "不動 HOLD"
+                    arrow = "●"
+
+                conf_pill = {"HIGH": "高信心", "MEDIUM": "中信心", "LOW": "低信心", "NONE": "無訊號"}.get(confidence, "—")
+                fire = " 🔥" if action in ("STRONG_BUY", "STRONG_SELL") else ""
+
+                # Build action banner
+                sl_txt = f"止損 ${tp['stop_loss']:.2f}" if tp.get('stop_loss') else ""
+                tp1_txt = f"TP1 ${tp['tp1']:.2f}" if tp.get('tp1') else ""
+                tp2_txt = f"TP2 ${tp['tp2']:.2f}" if tp.get('tp2') else ""
+                rr_txt = f"R:R 1:{tp['risk_reward']:.2f}" if tp.get('risk_reward') else ""
+                pos_txt = f"倉位 {tp['position_size_pct']}%" if tp.get('position_size_pct') else ""
+
+                levels_line = " · ".join([x for x in [sl_txt, tp1_txt, tp2_txt, rr_txt, pos_txt] if x])
+
+                st.markdown(f"""
+                <div style="background:{banner_bg};color:white;padding:18px 24px;border-radius:14px;margin-bottom:14px;box-shadow:0 2px 8px rgba(0,0,0,0.12);">
+                    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+                        <div style="font-size:36px;font-weight:900;letter-spacing:2px;">
+                            {arrow} {big_text}{fire}
+                        </div>
+                        <div style="background:rgba(255,255,255,0.25);padding:4px 12px;border-radius:8px;font-size:13px;font-weight:700;">
+                            {conf_pill} · 強度 {sig['strength']}%
+                        </div>
+                    </div>
+                    <div style="font-size:15px;margin-top:10px;opacity:0.95;font-weight:500;">
+                        📌 {entry_trigger}
+                    </div>
+                    {f'<div style="font-size:13px;margin-top:6px;opacity:0.9;font-family:JetBrains Mono,monospace;">{levels_line}</div>' if levels_line else ''}
+                </div>
+                """, unsafe_allow_html=True)
 
                 col_chart, col_info = st.columns([2.5, 1])
 
@@ -1106,9 +1667,115 @@ if scan_btn or auto_refresh:
                                 <span style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:{sig_color};">{sig['strength']}%</span>
                                 <span class="metric-label" style="display:block;">訊號強度</span>
                             </div>
+                            <div style="margin-top:10px;font-size:11px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;">
+                                買分 {sig.get('buy_score',0)} | 賣分 {sig.get('sell_score',0)} | 淨 {sig.get('net_score',0):+.1f}
+                            </div>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
+
+                    # [IMPROVEMENT #2] Multi-EMA array + [#1/#3] MACD momentum
+                    ema_state = sig.get('ema_array_state', 'neutral')
+                    ema_state_color = {
+                        'bullish_strong': '#4caf50',
+                        'bullish': '#66bb6a',
+                        'bearish_strong': '#e53935',
+                        'bearish': '#ef5350',
+                        'neutral': '#9e9e9e'
+                    }.get(ema_state, '#9e9e9e')
+                    ema_state_label = {
+                        'bullish_strong': '強多頭排列 🟢',
+                        'bullish': '偏多',
+                        'bearish_strong': '強空頭排列 🔴',
+                        'bearish': '偏空',
+                        'neutral': '混亂'
+                    }.get(ema_state, '—')
+
+                    mom = sig.get('macd_momentum', {})
+                    mom_color = '#4caf50' if mom.get('score', 0) > 0 else ('#e53935' if mom.get('score', 0) < 0 else '#9e9e9e')
+
+                    st.markdown(f"""
+                    <div class="signal-card">
+                        <div class="section-title">動能分析 (升級)</div>
+                        <div class="signal-row">
+                            <span class="dot" style="background-color:{ema_state_color};"></span>
+                            <span class="label-text">EMA排列</span>
+                            <span class="value-text" style="color:{ema_state_color};">{ema_state_label}</span>
+                        </div>
+                        <div class="signal-row">
+                            <span class="dot" style="background-color:{mom_color};"></span>
+                            <span class="label-text">MACD動能</span>
+                            <span class="value-text" style="color:{mom_color};">{mom.get('desc', '—')}</span>
+                        </div>
+                        {f'<div class="signal-row"><span class="dot dot-red"></span><span class="label-text">假突破</span><span class="value-text" style="color:#e53935;">⚠️ 檢測到假突破</span></div>' if sig.get('is_fake_breakout') else ''}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # [IMPROVEMENT #6] MTF Resonance card
+                    reso = sig.get('mtf_resonance') or {}
+                    if reso.get('checks'):
+                        reso_state = reso.get('state', 'none')
+                        reso_color = {'strong': '#4caf50', 'partial': '#ff9800', 'none': '#9e9e9e'}.get(reso_state)
+                        reso_label = {'strong': '✅ 全部共振', 'partial': '⚠️ 部分共振', 'none': '❌ 無共振'}.get(reso_state)
+                        bonus_txt = f" (+{reso['bonus']}%強度)" if reso.get('bonus', 0) > 0 else ""
+
+                        checks_html = ""
+                        for ck in reso['checks']:
+                            icon = "✓" if ck['agree'] else "✗"
+                            c_color = "#4caf50" if ck['agree'] else "#9e9e9e"
+                            checks_html += f'<div class="trade-record" style="color:{c_color};">{icon} {ck["tf"]}: {ck["reason"]}</div>'
+
+                        st.markdown(f"""
+                        <div class="signal-card">
+                            <div class="section-title">多時間框架共振</div>
+                            <div style="text-align:center;font-size:14px;font-weight:600;color:{reso_color};margin-bottom:8px;">
+                                {reso_label}{bonus_txt}
+                            </div>
+                            {checks_html}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # [IMPROVEMENT #7] Trade Plan card
+                    tp = sig.get('trade_plan') or {}
+                    if tp.get('stop_loss') is not None and sig['signal_type'] != 'hold':
+                        is_long = sig['signal_type'] in ('strong_buy', 'buy', 'watch_buy')
+                        plan_color = '#4caf50' if is_long else '#e53935'
+                        direction = "做多" if is_long else "做空"
+                        rr = tp.get('risk_reward') or 0
+                        rr_color = '#4caf50' if rr >= 2 else ('#ff9800' if rr >= 1 else '#e53935')
+
+                        st.markdown(f"""
+                        <div class="signal-card" style="border-left:4px solid {plan_color};">
+                            <div class="section-title">📋 交易計劃</div>
+                            <div style="text-align:center;margin-bottom:10px;">
+                                <span style="font-size:16px;font-weight:700;color:{plan_color};">{direction}</span>
+                                <span style="font-size:12px;color:var(--text-secondary);margin-left:8px;">建議倉位 {tp['position_size_pct']}%</span>
+                            </div>
+                            <div class="trade-record" style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f0f0e8;">
+                                <span style="color:var(--text-secondary);">進場</span>
+                                <span style="font-weight:700;">${tp['entry']:.2f}</span>
+                            </div>
+                            <div class="trade-record" style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f0f0e8;">
+                                <span style="color:var(--text-secondary);">🛑 止損</span>
+                                <span style="font-weight:700;color:#e53935;">${tp['stop_loss']:.2f}</span>
+                            </div>
+                            <div class="trade-record" style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f0f0e8;">
+                                <span style="color:var(--text-secondary);">✅ TP1 (50%)</span>
+                                <span style="font-weight:700;color:#4caf50;">${tp['tp1']:.2f}</span>
+                            </div>
+                            <div class="trade-record" style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f0f0e8;">
+                                <span style="color:var(--text-secondary);">🚀 TP2 (剩餘)</span>
+                                <span style="font-weight:700;color:#4caf50;">${tp['tp2']:.2f}</span>
+                            </div>
+                            <div class="trade-record" style="display:flex;justify-content:space-between;padding:6px 0;">
+                                <span style="color:var(--text-secondary);">⚖️ R:R</span>
+                                <span style="font-weight:700;color:{rr_color};">1:{rr:.2f}</span>
+                            </div>
+                            <div style="margin-top:8px;padding:6px;background:#f9f9f4;border-radius:6px;font-size:11px;color:var(--text-secondary);line-height:1.4;">
+                                💡 TP1達標後移動止損至進場價，剩餘部位看向TP2。ATR: ${sig.get('atr', 0):.2f}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
                     # S/R levels table
                     if support or resistance:
