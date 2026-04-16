@@ -5,6 +5,7 @@ Multi-stock, Multi-timeframe, Telegram + Voice Alerts
 """
 
 import streamlit as st
+st.set_page_config(initial_sidebar_state="collapsed")
 import pandas as pd
 import numpy as np
 import yfinance as yf
