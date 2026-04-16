@@ -5,7 +5,6 @@ Multi-stock, Multi-timeframe, Telegram + Voice Alerts
 """
 
 import streamlit as st
-st.set_page_config(initial_sidebar_state="expanded")
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -19,6 +18,7 @@ import threading
 from io import BytesIO
 
 # ─── Page Config ───
+st.set_page_config(initial_sidebar_state="expanded")
 st.set_page_config(
     page_title="三重確認交易系統",
     page_icon="📊",
