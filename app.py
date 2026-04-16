@@ -18,12 +18,12 @@ import threading
 from io import BytesIO
 
 # ─── Page Config ───
-st.set_page_config(initial_sidebar_state="expanded")
+#st.set_page_config(initial_sidebar_state="expanded")
 st.set_page_config(
     page_title="三重確認交易系統",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    
 )
 
 # ─── Custom CSS matching screenshot style ───
