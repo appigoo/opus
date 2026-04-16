@@ -22,7 +22,7 @@ st.set_page_config(
     page_title="三重確認交易系統",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
 
 # ─── Custom CSS matching screenshot style ───
